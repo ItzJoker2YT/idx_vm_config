@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # =================================================================
-#  ULTIMATE VM MANAGER - INSTANT CONNECT EDITION
+#  ULTIMATE VM MANAGER - JOKERS FINAL VERSION
 # =================================================================
 
-# --- 1. DEFINE COLORS ---
+# --- 1. DEFINE COLORS (Foreground & Background) ---
 RESET='\033[0m'
 BLACK='\033[0;30m'  RED='\033[0;31m'    GREEN='\033[0;32m'
 YELLOW='\033[0;33m' BLUE='\033[0;34m'   PURPLE='\033[0;35m'
@@ -50,7 +50,6 @@ print_status() {
 }
 
 check_port_open() {
-    # Pure Bash TCP check (Very fast)
     (echo > /dev/tcp/127.0.0.1/$1) >/dev/null 2>&1
 }
 
@@ -129,7 +128,6 @@ select_storage_location() {
 
     while IFS='|' read -r path label type; do
         mkdir -p "$path" 2>/dev/null || true
-        
         if [ -w "$path" ]; then
             local df_out=$(df -h "$path" | tail -1)
             local avail=$(echo "$df_out" | awk '{print $4}')
@@ -337,22 +335,26 @@ EOF
     print_status "SUCCESS" "VM '$VM_NAME' created successfully."
 }
 
-# --- THE IMPROVED START LOGIC ---
+# --- THE START LOGIC ---
 start_vm() {
     local vm_name=$1
     if ! load_vm_config "$vm_name"; then return; fi
     
-    # 1. ZOMBIE CHECK (Running but closed port)
+    if [[ ! -f "$IMG_FILE" ]]; then
+        print_status "ERROR" "Image file missing: $IMG_FILE"
+        return
+    fi
+
+    # ZOMBIE CHECK
     if pgrep -f "$IMG_FILE" >/dev/null; then
         if ! check_port_open "$SSH_PORT"; then
-            print_status "WARN" "VM process found, but Port $SSH_PORT is unresponsive."
-            print_status "INFO" "Killing zombie process and restarting..."
+            print_status "WARN" "VM unresponsive. Restarting..."
             pkill -f "$IMG_FILE"
             sleep 1
         fi
     fi
 
-    # 2. START IF NOT RUNNING
+    # START QEMU
     if ! pgrep -f "$IMG_FILE" >/dev/null; then
         print_status "INFO" "Starting $VM_NAME..."
         
@@ -361,8 +363,7 @@ start_vm() {
             setup_vm_image
         fi
         
-        # Clear known_hosts to prevent "man in the middle" warnings on reconnect
-        ssh-keygen -f "$HOME/.ssh/known_hosts" -R "[localhost]:$SSH_PORT" >/dev/null 2>&1
+        ssh-keygen -f "$HOME/.ssh/known_hosts" -R "[localhost]:$SSH_PORT" >/dev/null 2>&1 || true
 
         local qemu_cmd=(
             qemu-system-x86_64 -enable-kvm -m "$MEMORY" -smp "$CPUS" -cpu host
@@ -383,41 +384,51 @@ start_vm() {
             done
         fi
         
-        "${qemu_cmd[@]}"
+        if ! "${qemu_cmd[@]}" >/tmp/vm_boot.log 2>&1; then
+            print_status "ERROR" "VM failed to start. Error log:"
+            cat /tmp/vm_boot.log
+            return
+        fi
+        
         print_status "SUCCESS" "VM Process Launched."
     else
         print_status "INFO" "VM is already running. Reconnecting..."
     fi
 
-    # 3. SMART WAIT (Polls port every 1s)
+    # SMART WAIT
     echo -n "Waiting for boot..."
     local attempts=0
-    local max_attempts=45 # Wait up to 45 seconds
     while ! check_port_open "$SSH_PORT"; do
         sleep 1
         echo -n "."
         attempts=$((attempts+1))
-        if [ $attempts -ge $max_attempts ]; then
+        if [ $attempts -ge 60 ]; then
             echo ""
-            print_status "ERROR" "VM failed to boot within 45 seconds."
+            print_status "ERROR" "VM failed to boot."
             return
         fi
     done
     echo " Ready!"
 
-    # 4. INSTANT CONNECT (No Warning Messages)
-    print_status "INFO" "Connecting..."
+    # RETRY CONNECTION LOOP
+    print_status "INFO" "Connecting... (Wait for Cloud-Init)"
+    local ssh_opts="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR -p $SSH_PORT -o ConnectTimeout=30 -o ServerAliveInterval=30 -o PreferredAuthentications=password,keyboard-interactive"
     
-    # -o UserKnownHostsFile=/dev/null -> Don't save key (Avoids pollution)
-    # -o StrictHostKeyChecking=no -> Don't ask yes/no
-    # -o LogLevel=ERROR -> Hides "Warning: Permanently added..."
-    local ssh_opts="-o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -o LogLevel=ERROR -p $SSH_PORT"
+    local retries=0
+    while [ $retries -lt 20 ]; do
+        if command -v sshpass &> /dev/null; then
+            if sshpass -p "$PASSWORD" ssh $ssh_opts "$USERNAME@localhost"; then return; fi
+        else
+            if ssh $ssh_opts "$USERNAME@localhost"; then return; fi
+        fi
+        
+        echo -ne "   Retry $((retries+1))/20: Waiting for VM... \r"
+        sleep 5
+        retries=$((retries+1))
+    done
     
-    if command -v sshpass &> /dev/null; then
-        sshpass -p "$PASSWORD" ssh $ssh_opts "$USERNAME@localhost"
-    else
-        ssh $ssh_opts "$USERNAME@localhost"
-    fi
+    echo ""
+    print_status "ERROR" "Connection failed. Try deleting and recreating the VM."
 }
 
 is_vm_running() {
